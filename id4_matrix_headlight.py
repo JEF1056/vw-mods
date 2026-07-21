@@ -49,6 +49,10 @@ SECURITY_LEVEL_3      = 0x03   # Extended (needed for coding)
 DID_LONG_CODING       = 0xF190  # Module long coding data
 DID_VIN               = 0xF180  # Vehicle Identification Number
 
+# UDS Memory Services
+SID_READ_MEMORY       = 0x23   # ReadMemoryByAddress
+SID_WRITE_MEMORY      = 0x2D   # WriteMemoryByAddress
+
 # ============================================================
 # VW Seed-Key Algorithm (Reverse-engineered)
 # ============================================================
@@ -613,6 +617,151 @@ class BackupManager:
 
 
 # ============================================================
+# ECU Flash Dump
+# ============================================================
+
+class FlashDumper:
+    """Dumps ECU flash memory using UDS 0x23 ReadMemoryByAddress."""
+    
+    # Common VW ID.4 Module 09 flash addresses
+    FLASH_START = 0x08000000  # Start of flash memory
+    FLASH_SIZE = 0x200000     # 2MB total flash size
+    
+    def __init__(self, can_interface, block_size=0x1000):
+        self.can = can_interface
+        self.block_size = block_size  # Read 4KB at a time
+    
+    def build_read_memory_request(self, address, size):
+        """Build UDS 0x23 ReadMemoryByAddress request."""
+        # Address format: 2 bytes (big-endian)
+        addr_bytes = address.to_bytes(2, byteorder='big')
+        # Size format: 1 byte (up to 255 bytes) or 2 bytes (up to 65535 bytes)
+        if size <= 255:
+            size_bytes = size.to_bytes(1, byteorder='big')
+        else:
+            size_bytes = size.to_bytes(2, byteorder='big')
+        
+        # Memory address specifier: 0x21 (physical addressing)
+        return [SID_READ_MEMORY, 0x21] + list(addr_bytes) + list(size_bytes)
+    
+    def parse_read_memory_response(self, response):
+        """Parse UDS 0x23 response and extract memory data."""
+        if response and response[0] == (SID_READ_MEMORY + 0x40):
+            # Response format: [0x63][memory data...]
+            return response[1:]
+        return None
+    
+    def dump_flash(self, start_address=None, size=None, output_file=None):
+        """Dump ECU flash memory."""
+        if start_address is None:
+            start_address = self.FLASH_START
+        if size is None:
+            size = self.FLASH_SIZE
+        if output_file is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = f"ecu_flash_{timestamp}.bin"
+        
+        print(f"[+] Dumping ECU flash:")
+        print(f"    Start: 0x{start_address:08X}")
+        print(f"    Size:  {size} bytes ({size/1024:.1f} KB)")
+        print(f"    Output: {output_file}")
+        print()
+        
+        total_bytes = 0
+        flash_data = bytearray()
+        
+        # Calculate number of blocks
+        num_blocks = (size + self.block_size - 1) // self.block_size
+        
+        print(f"[*] Reading {num_blocks} blocks...")
+        print()
+        
+        for i in range(num_blocks):
+            address = start_address + (i * self.block_size)
+            remaining = size - total_bytes
+            read_size = min(self.block_size, remaining)
+            
+            # Build and send request
+            request = self.build_read_memory_request(address, read_size)
+            response = self.can.send_request(request, can_id=0x7DF)
+            
+            data = self.parse_read_memory_response(response)
+            
+            if data:
+                flash_data.extend(data)
+                total_bytes += len(data)
+                progress = (total_bytes / size) * 100
+                print(f"\r[*] Progress: {total_bytes}/{size} bytes ({progress:.1f}%)", end='', flush=True)
+            else:
+                print(f"\n[-] Error reading block {i} at 0x{address:08X}")
+                print(f"    Response: {response.hex() if response else 'None'}")
+                break
+        
+        print()  # New line after progress
+        
+        if total_bytes > 0:
+            # Save to file
+            with open(output_file, 'wb') as f:
+                f.write(bytes(flash_data))
+            
+            print(f"[+] Flash dump complete!")
+            print(f"    Saved: {output_file}")
+            print(f"    Size: {total_bytes} bytes")
+            
+            # Save metadata
+            meta_file = output_file.replace('.bin', '_meta.txt')
+            with open(meta_file, 'w') as f:
+                f.write(f"ECU Flash Dump\n")
+                f.write(f"{'=' * 50}\n")
+                f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Start Address: 0x{start_address:08X}\n")
+                f.write(f"Size: {total_bytes} bytes\n")
+                f.write(f"Block Size: {self.block_size} bytes\n")
+                f.write(f"File: {output_file}\n")
+            
+            print(f"    Metadata: {meta_file}")
+            
+            return output_file
+        else:
+            print(f"[-] No data read. Check security access and connection.")
+            return None
+    
+    def extract_sa2_script(self, flash_data):
+        """
+        Extract SA2 bytecode script from flash data.
+        The SA2 script is typically embedded in the flash container.
+        This is a simplified extraction - actual location varies by ECU.
+        """
+        print("[+] Searching for SA2 script in flash data...")
+        
+        # Common SA2 script markers
+        markers = [b'SA2', b'sa2', b'ECAS', b'ECal']
+        
+        for marker in markers:
+            pos = flash_data.find(marker)
+            if pos >= 0:
+                print(f"    Found marker '{marker.decode()}' at offset 0x{pos:08X}")
+                # Extract 256 bytes around the marker
+                start = max(0, pos - 16)
+                end = min(len(flash_data), pos + 256)
+                script_data = flash_data[start:end]
+                
+                output_file = f"sa2_script_0x{pos:08X}.bin"
+                with open(output_file, 'wb') as f:
+                    f.write(script_data)
+                
+                print(f"    Extracted: {output_file}")
+                print(f"    Offset: 0x{pos:08X}")
+                print(f"    Size: {len(script_data)} bytes")
+                
+                return output_file
+        
+        print("[!] SA2 script not found with simple markers")
+        print("[!] You may need to reverse-engineer the exact location")
+        return None
+
+
+# ============================================================
 # UDS Session & Security
 # ============================================================
 
@@ -1091,6 +1240,8 @@ def main_interactive():
     print("  5) Check OBD dongle")
     print("  6) Exit")
     print("  7) Test security access (capture seed/key)")
+    print("  8) Dump ECU flash")
+    print("  9) Extract SA2 script from flash file")
     print()
     
     action = get_input("Action", "1")
@@ -1107,6 +1258,70 @@ def main_interactive():
             session.set_session(EXTENDED_SESSION)
             session.unlock_security(SECURITY_LEVEL_3)
             can.close()
+        return
+    elif action == "8":
+        channel = get_input("CAN channel", "can0")
+        vin = get_input("VIN (for seed-key calculation, or leave blank)")
+        print("\nAvailable algorithms:")
+        for i, algo in enumerate(VW_ALGORITHMS, 1):
+            print(f"  {i}) {algo[0]}")
+        print(f"  6) VIN-dependent (algo5)")
+        print(f"  7) Manual key entry")
+        algo_choice = get_input("Algorithm", "2")
+        algorithm_map = {
+            '1': 'algo1_mqb_standard',
+            '2': 'algo4_meb_platform',
+            '3': 'algo3_mqb_evo',
+            '4': 'algo2_simple_xor',
+            '5': 'algo4_meb_platform',
+            '6': 'algo5_vin_dependent',
+        }
+        algorithm = None
+        manual_key = None
+        if algo_choice == '7':
+            manual_key = get_input("Manual key (hex, e.g. 'ABCD')")
+        else:
+            algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+        
+        print("\n[*] Connecting to ECU...")
+        can = VWCANInterface(channel=channel)
+        if can.connect():
+            session = UDSSession(can)
+            session.set_session(EXTENDED_SESSION)
+            
+            print("[*] Unlocking security access...")
+            if session.unlock_security(SECURITY_LEVEL_3, vin, algorithm, manual_key):
+                print("[*] Security access granted!")
+                
+                # Switch to programming session for flash access
+                print("[*] Switching to programming session...")
+                session.set_session(PROGRAMMING_SESSION)
+                
+                # Dump flash
+                dumper = FlashDumper(can)
+                output = dumper.dump_flash()
+                
+                if output:
+                    print("\n[*] Now extracting SA2 script...")
+                    with open(output, 'rb') as f:
+                        flash_data = f.read()
+                    dumper.extract_sa2_script(flash_data)
+            else:
+                print("[!] Security access failed. Cannot dump flash.")
+            can.close()
+        return
+    elif action == "9":
+        flash_file = get_input("Path to flash dump file (.bin)")
+        if flash_file:
+            try:
+                with open(flash_file, 'rb') as f:
+                    flash_data = f.read()
+                print(f"\n[*] Loaded {len(flash_data)} bytes from {flash_file}")
+                
+                dumper = FlashDumper(None)
+                dumper.extract_sa2_script(flash_data)
+            except FileNotFoundError:
+                print(f"[-] File not found: {flash_file}")
         return
     elif action == "5":
         channel = get_input("CAN channel", "can0")
