@@ -28,7 +28,7 @@ Unlocks IQ.LIGHT matrix headlight functionality on VW ID.4 vehicles by directly 
 ### 1. Install Dependencies
 
 ```bash
-pip install python-can
+pip install -r requirements.txt
 ```
 
 ### 2. Set Up CAN Interface
@@ -40,49 +40,30 @@ sudo ip link set can0 up type can bitrate 500000
 ### 3. Check Your Dongle
 
 ```bash
-python3 id4_matrix_headlight.py --check
+python3 id4_matrix_headlight.py
 ```
 
-This verifies your adapter supports all required features.
+Select option `5` to verify your adapter supports all required features.
 
-### 4. Read Current Coding (Test Mode)
+### 4. Run the Script
 
 ```bash
-python3 id4_matrix_headlight.py --test --vin YOUR_VIN_HERE
+python3 id4_matrix_headlight.py
 ```
 
-This reads your current module coding without making changes.
+The interactive menu will guide you through:
+1. **Enable matrix headlights** - Full automated enable with backup
+2. **Analyze coding bytes** - See what changes would be made
+3. **Restore from backup** - Revert to original coding
+4. **List backups** - View all saved coding backups
+5. **Check OBD dongle** - Verify adapter capabilities
 
-### 5. Analyze Coding Bytes
+### 5. Verify It Worked
 
-```bash
-python3 id4_matrix_headlight.py --analyze --vin YOUR_VIN_HERE
-```
-
-Shows which bytes control matrix headlight functionality.
-
-### 6. Enable Matrix Headlights
-
-```bash
-python3 id4_matrix_headlight.py --vin YOUR_VIN_HERE
-```
-
-Writes the modified coding. Your original coding is automatically backed up.
-
-## Usage
-
-```
-python3 id4_matrix_headlight.py [OPTIONS]
-
-Options:
-  --vin VIN           Vehicle VIN for seed-key calculation
-  --test              Test mode - read coding but don't write
-  --analyze           Analyze coding bytes to find matrix headlight controls
-  --channel CHANNEL   CAN channel name (default: can0)
-  --restore           Restore coding from latest backup
-  --list-backups      List all available backups
-  --check             Check OBD dongle capabilities
-```
+After running and restarting your vehicle:
+- Drive at night with **high beams enabled** (auto or manual)
+- Matrix headlights will **dynamically carve out dark spots** around oncoming cars while keeping the rest illuminated
+- Check headlight settings menu - should show "IQ.LIGHT" or "Matrix LED" option
 
 ## How It Works
 
@@ -96,13 +77,20 @@ VW vehicles use UDS (Unified Diagnostic Services) protocol over CAN bus. To writ
 
 This script bypasses the online authentication by:
 
-1. Using the reverse-engineered VW seed-key algorithm to authenticate locally
+1. Using reverse-engineered VW seed-key algorithms to authenticate locally
 2. Directly writing coding bytes to Module 09 (Central Electronics)
 3. No VW server connection required
 
 ### What Gets Changed
 
-The script modifies the long coding data in Module 09 to enable matrix headlight functionality. The exact byte modification depends on your vehicle's hardware and production date.
+The script:
+1. Reads your current long coding from Module 09
+2. Detects if matrix headlight hardware is present
+3. Calculates exact modifications:
+   - Byte 15, bit 6: Enable IQ.LIGHT feature
+   - Byte 16, bit 7: Enable matrix beam control
+   - Byte 17, bits 0-2: Enable adaptive light function
+4. Writes the modified coding
 
 ### Backup & Restore
 
@@ -118,7 +106,8 @@ backups/
 
 Restore to original:
 ```bash
-python3 id4_matrix_headlight.py --restore --vin YOUR_VIN_HERE
+python3 id4_matrix_headlight.py
+# Select option 3: Restore from backup
 ```
 
 ## Troubleshooting
@@ -129,7 +118,7 @@ python3 id4_matrix_headlight.py --restore --vin YOUR_VIN_HERE
 - Ensure CAN interface is up: `sudo ip link set can0 up type can bitrate 500000`
 
 ### "Security access failed"
-- Try with your VIN: `--vin YOUR_VIN_HERE`
+- Try with your VIN (option 1 will prompt for it)
 - The VIN-dependent seed-key algorithm is more accurate for 2023+ models
 - Some adapters need a few seconds to initialize after connection
 
@@ -141,13 +130,14 @@ python3 id4_matrix_headlight.py --restore --vin YOUR_VIN_HERE
 ### Running as non-root
 Some CAN interfaces require root privileges:
 ```bash
-sudo python3 id4_matrix_headlight.py --vin YOUR_VIN_HERE
+sudo python3 id4_matrix_headlight.py
 ```
 
 ## Notes
 
 - **Hardware prerequisite**: Your ID.4 must already have matrix headlight units installed. This is a software unlock, not a hardware conversion.
-- **Test before writing**: Always run with `--test` first to verify your adapter works
+- **High beams required**: Matrix headlights only work when high beams are active (auto or manual)
+- **Test before writing**: Run option 2 first to see what changes would be made
 - **Backup is automatic**: Your original coding is saved before any write operation
 - **Restart required**: After writing coding, restart the vehicle for changes to take effect
 
@@ -156,6 +146,7 @@ sudo python3 id4_matrix_headlight.py --vin YOUR_VIN_HERE
 ```
 vw-mods/
 ├── id4_matrix_headlight.py    # Main script
+├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
 └── backups/                   # Auto-created backup directory
 ```
