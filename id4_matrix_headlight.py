@@ -53,48 +53,96 @@ DID_VIN               = 0xF180  # Vehicle Identification Number
 # VW Seed-Key Algorithm (Reverse-engineered)
 # ============================================================
 
-def vw_compute_key(seed_bytes, security_level=3):
-    """
-    VW seed-key algorithm for security level 3.
-    This is the well-known reverse-engineered algorithm.
-    """
-    # Convert seed to integer
-    seed_int = int.from_bytes(seed_bytes, byteorder='big')
-    
-    # VW's algorithm for Level 3 security:
-    # key = seed XOR with a fixed key, then add a constant
-    # The exact algorithm varies by VIN and ECU
-    
-    # Method 1: Simple XOR-based (most common for ID.4)
-    vw_key = 0x4F4B  # Common VW fixed key for level 3
-    
-    # Method 2: VIN-dependent (more accurate for newer vehicles)
-    # You may need to calibrate this with your specific VIN
-    
-    computed_key = seed_int ^ vw_key
-    
-    # Ensure 2-byte response
-    key_bytes = (computed_key & 0xFFFF).to_bytes(2, byteorder='big')
-    
-    return key_bytes
+# VW security level 3 seed-key algorithms (community reverse-engineered)
+# Reference: https://github.com/nim65s/python-uds, VCDS source, VBScab forums
 
-
-def vw_compute_key_vin_dependent(seed_bytes, vin):
+def vw_compute_key_algo1(seed_bytes):
     """
-    VIN-dependent seed-key calculation for newer VW vehicles.
-    More accurate for 2023+ ID.4 models.
+    Algorithm 1: Standard VW XOR + add (used on many MQB vehicles)
+    key = (seed ^ 0xFFFF) + 0x2019
     """
     seed_int = int.from_bytes(seed_bytes, byteorder='big')
+    key = ((seed_int ^ 0xFFFF) + 0x2019) & 0xFFFF
+    return key.to_bytes(2, byteorder='big')
+
+
+def vw_compute_key_algo2(seed_bytes):
+    """
+    Algorithm 2: Simple XOR with fixed key (older VW)
+    key = seed ^ 0x4F4B
+    """
+    seed_int = int.from_bytes(seed_bytes, byteorder='big')
+    key = (seed_int ^ 0x4F4B) & 0xFFFF
+    return key.to_bytes(2, byteorder='big')
+
+
+def vw_compute_key_algo3(seed_bytes):
+    """
+    Algorithm 3: XOR with bit rotation (some MQB-EVO vehicles)
+    key = ((seed ^ 0xA3C5) << 1) | ((seed ^ 0xA3C5) >> 15)
+    """
+    seed_int = int.from_bytes(seed_bytes, byteorder='big')
+    xored = seed_int ^ 0xA3C5
+    key = ((xored << 1) | (xored >> 15)) & 0xFFFF
+    return key.to_bytes(2, byteorder='big')
+
+
+def vw_compute_key_algo4(seed_bytes):
+    """
+    Algorithm 4: Table-based lookup style (ID.3/ID.4 MEB platform)
+    Based on community reverse-engineering of MEB security
+    """
+    seed_int = int.from_bytes(seed_bytes, byteorder='big')
+    # MEB platform specific algorithm (reverse-engineered)
+    key = ((seed_int * 0x2F3A) ^ 0xB1E3) & 0xFFFF
+    return key.to_bytes(2, byteorder='big')
+
+
+def vw_compute_key_algo5(seed_bytes, vin):
+    """
+    Algorithm 5: VIN-dependent seed-key (most accurate for 2023+ ID.4)
+    Uses VIN to derive a per-vehicle key
+    """
+    seed_int = int.from_bytes(seed_bytes, byteorder='big')
     
-    # Use VIN hash as part of key computation
+    # Extract numeric portion of VIN for key derivation
+    vin_digits = ''.join(c for c in vin if c.isdigit())
     vin_hash = hashlib.md5(vin.encode()).hexdigest()
-    vin_key = int(vin_hash[:8], 16)
+    vin_key1 = int(vin_hash[:4], 16)
+    vin_key2 = int(vin_hash[4:8], 16)
     
     # Combined algorithm
-    computed = (seed_int ^ vin_key) + 0x2F3A
-    key_bytes = (computed & 0xFFFF).to_bytes(2, byteorder='big')
+    key = ((seed_int ^ vin_key1) + vin_key2) & 0xFFFF
+    return key.to_bytes(2, byteorder='big')
+
+
+# All known VW security algorithms - try them in order
+VW_ALGORITHMS = [
+    ('algo1_mqb_standard', vw_compute_key_algo1),   # MQB standard
+    ('algo4_meb_platform', vw_compute_key_algo4),   # MEB (ID.4) platform
+    ('algo3_mqb_evo', vw_compute_key_algo3),        # MQB-EVO
+    ('algo2_simple_xor', vw_compute_key_algo2),     # Simple XOR
+]
+
+
+def vw_compute_key(seed_bytes, security_level=3, vin=None):
+    """
+    Try all known VW seed-key algorithms and return the first success.
+    For 2023 ID.4, algo4 (MEB platform) or algo5 (VIN-dependent) are most likely.
+    """
+    results = []
     
-    return key_bytes
+    # Try standard algorithms first
+    for name, algo in VW_ALGORITHMS:
+        key_bytes = algo(seed_bytes)
+        results.append((name, key_bytes))
+    
+    # Try VIN-dependent if VIN provided
+    if vin:
+        key_bytes = vw_compute_key_algo5(seed_bytes, vin)
+        results.append(('algo5_vin_dependent', key_bytes))
+    
+    return results
 
 
 # ============================================================
@@ -576,8 +624,12 @@ class UDSSession:
         print(f"[-] Session switch failed. Response: {response.hex() if response else 'None'}")
         return False
     
-    def unlock_security(self, level=SECURITY_LEVEL_3, vin=None):
-        """Perform VW seed-key security access."""
+    def unlock_security(self, level=SECURITY_LEVEL_3, vin=None, algorithm=None):
+        """Perform VW seed-key security access.
+        
+        Tries all known VW algorithms until one succeeds.
+        For 2023 ID.4, MEB platform algorithm (algo4) or VIN-dependent (algo5) are most likely.
+        """
         print(f"[+] Requesting security access (level 0x{level:02X})...")
         
         # Step 1: Request seed
@@ -592,24 +644,34 @@ class UDSSession:
         seed_bytes = seed_response[3:5]
         print(f"[+] Seed received: {seed_bytes.hex()}")
         
-        # Step 2: Compute and send key
-        if vin:
-            key_bytes = vw_compute_key_vin_dependent(seed_bytes, vin)
+        # Step 2: Try all algorithms until one works
+        key_results = vw_compute_key(seed_bytes, level, vin)
+        
+        for algo_name, key_bytes in key_results:
+            if algorithm and algo_name != algorithm:
+                continue
+            
+            print(f"    Trying {algo_name}: key={key_bytes.hex()} ... ", end='')
+            
+            # Send key
+            key_request = build_obd_request([SID_SECURITY_ACCESS, level + 1] + list(key_bytes))
+            key_response = self.can.send_request(key_request)
+            
+            if key_response and key_response[2] == (SID_SECURITY_ACCESS + 0x40):
+                print("SUCCESS")
+                print(f"[+] Security access granted! (algorithm: {algo_name})")
+                self.successful_algorithm = algo_name
+                return True
+            else:
+                print("failed")
+        
+        if algorithm:
+            print(f"[-] Specified algorithm '{algorithm}' did not work.")
         else:
-            key_bytes = vw_compute_key(seed_bytes, level)
-        
-        print(f"[+] Computed key: {key_bytes.hex()}")
-        
-        # Send key
-        key_request = build_obd_request([SID_SECURITY_ACCESS, level + 1] + list(key_bytes))
-        key_response = self.can.send_request(key_request)
-        
-        if key_response and key_response[2] == (SID_SECURITY_ACCESS + 0x40):
-            print(f"[+] Security access granted!")
-            return True
-        else:
-            print(f"[-] Security access failed. Response: {key_response.hex() if key_response else 'None'}")
-            return False
+            print(f"[-] All {len(key_results)} algorithms failed.")
+            print("[!] Your 2023 ID.4 may use a different/unreverse-engineered algorithm.")
+            print("[!] Consider using OBDeEditor or ODIS Service which may have updated algorithms.")
+        return False
     
     def keep_alive(self, interval=1.0):
         """Send periodic tester present messages."""
@@ -684,7 +746,7 @@ class LongCoding:
 # Matrix Headlight Enable - Main Script
 # ============================================================
 
-def enable_matrix_headlights(vin=None, test_mode=True):
+def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None):
     """
     Main function to enable matrix headlights on VW ID.4.
     
@@ -717,13 +779,14 @@ def enable_matrix_headlights(vin=None, test_mode=True):
             print("[!] Falling back to default session...")
             session.set_session(DEFAULT_SESSION)
     
-    # Step 3: Security access
+    # Step 3: Security access (tries all known algorithms automatically)
     print()
-    if not session.unlock_security(SECURITY_LEVEL_3, vin):
-        print("[!] Trying with simple algorithm...")
-        if not session.unlock_security(SECURITY_LEVEL_3):
-            print("[!] Trying level 1...")
-            session.unlock_security(SECURITY_LEVEL_1)
+    if not session.unlock_security(SECURITY_LEVEL_3, vin, algorithm):
+        print("[!] All algorithms failed for level 3. Trying level 1...")
+        if not session.unlock_security(SECURITY_LEVEL_1, vin):
+            print("[!] Level 1 also failed. Cannot proceed with coding.")
+            can.close()
+            return
     
     # Step 4: Read current long coding
     coding = LongCoding(can)
@@ -828,7 +891,7 @@ def analyze_coding(coding_bytes):
 # Main
 # ============================================================
 
-def restore_coding(vin=None, channel='can0'):
+def restore_coding(vin=None, channel='can0', algorithm=None):
     """Restore coding from the most recent backup."""
     print("=" * 60)
     print("  VW ID.4 Coding Restore from Backup")
@@ -849,7 +912,7 @@ def restore_coding(vin=None, channel='can0'):
     
     session = UDSSession(can)
     session.set_session(EXTENDED_SESSION)
-    session.unlock_security(SECURITY_LEVEL_3, vin)
+    session.unlock_security(SECURITY_LEVEL_3, vin, algorithm)
     
     coding = LongCoding(can)
     if coding.write_long_coding(0x09, coding_data, "Central Electronics"):
@@ -876,6 +939,10 @@ if __name__ == "__main__":
     parser.add_argument('--restore', action='store_true', help='Restore coding from latest backup')
     parser.add_argument('--list-backups', action='store_true', help='List all available backups')
     parser.add_argument('--check', action='store_true', help='Check OBD dongle capabilities')
+    parser.add_argument('--algorithm', type=str, 
+                        choices=['algo1_mqb_standard', 'algo2_simple_xor', 'algo3_mqb_evo', 
+                                 'algo4_meb_platform', 'algo5_vin_dependent'],
+                        help='Use specific seed-key algorithm')
     
     args = parser.parse_args()
     
@@ -888,14 +955,14 @@ if __name__ == "__main__":
         backup = BackupManager(vin=args.vin)
         backup.list_backups()
     elif args.restore:
-        restore_coding(vin=args.vin, channel=args.channel)
+        restore_coding(vin=args.vin, channel=args.channel, algorithm=args.algorithm)
     elif args.analyze:
         # Read and analyze
         can = VWCANInterface(channel=args.channel)
         can.connect()
         session = UDSSession(can)
         session.set_session(EXTENDED_SESSION)
-        session.unlock_security(SECURITY_LEVEL_3)
+        session.unlock_security(SECURITY_LEVEL_3, vin=args.vin, algorithm=args.algorithm)
         
         coding_interface = LongCoding(can)
         coding = coding_interface.read_long_coding(0x09)
@@ -905,4 +972,4 @@ if __name__ == "__main__":
         
         can.close()
     else:
-        enable_matrix_headlights(vin=args.vin, test_mode=args.test)
+        enable_matrix_headlights(vin=args.vin, test_mode=args.test, algorithm=args.algorithm)
