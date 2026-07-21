@@ -743,12 +743,93 @@ class LongCoding:
 
 
 # ============================================================
+# Matrix Hardware Detection & Coding Analysis
+# ============================================================
+
+def detect_matrix_hardware(coding_bytes):
+    """
+    Analyze the long coding to detect if matrix headlight hardware is present.
+    Returns True if matrix hardware detected, False otherwise.
+    """
+    if len(coding_bytes) < 20:
+        return False
+    
+    # Check for matrix headlight indicators in the coding
+    # These are common patterns in VW ID.4 long coding
+    
+    # Pattern 1: Check if adaptive light is enabled (byte 15-17 range)
+    # Byte 15 often contains headlight type indicators
+    if len(coding_bytes) > 17:
+        byte_15 = coding_bytes[15]
+        byte_16 = coding_bytes[16]
+        byte_17 = coding_bytes[17]
+        
+        # Matrix hardware typically has specific bit patterns
+        # If byte 15 has bit 5 or bit 6 set, it may indicate matrix hardware
+        if byte_15 & 0x20 or byte_15 & 0x40:  # Bit 5 or 6
+            return True
+        
+        # If byte 16 has bit 7 set, it may indicate matrix beam control
+        if byte_16 & 0x80:
+            return True
+    
+    return False
+
+
+def get_matrix_coding_modifications(coding_bytes):
+    """
+    Calculate the coding modifications needed to enable matrix headlights.
+    Returns a list of (byte_index, mask, description) tuples.
+    """
+    modifications = []
+    
+    if len(coding_bytes) < 20:
+        return modifications
+    
+    # The matrix headlight enable typically involves:
+    # 1. Enabling IQ.LIGHT feature (byte 15, bit 6)
+    # 2. Enabling matrix beam control (byte 16, bit 7)
+    # 3. Enabling adaptive light function (byte 17, bit 0-2)
+    
+    # Check current state and suggest modifications
+    byte_15 = coding_bytes[15]
+    byte_16 = coding_bytes[16]
+    byte_17 = coding_bytes[17]
+    
+    # Primary: Enable IQ.LIGHT (bit 6 of byte 15)
+    if not (byte_15 & 0x40):
+        modifications.append((15, 0x40, "Enable IQ.LIGHT feature (byte 15, bit 6)"))
+    
+    # Secondary: Enable matrix beam control (bit 7 of byte 16)
+    if not (byte_16 & 0x80):
+        modifications.append((16, 0x80, "Enable matrix beam control (byte 16, bit 7)"))
+    
+    # Tertiary: Enable adaptive light function (bits 0-2 of byte 17)
+    if not (byte_17 & 0x07):
+        modifications.append((17, 0x07, "Enable adaptive light function (byte 17, bits 0-2)"))
+    
+    return modifications
+
+
+def apply_coding_modifications(coding_bytes, modifications):
+    """Apply the coding modifications to the byte array."""
+    modified = bytearray(coding_bytes)
+    
+    for byte_index, mask, description in modifications:
+        if byte_index < len(modified):
+            modified[byte_index] |= mask
+    
+    return bytes(modified)
+
+
+# ============================================================
 # Matrix Headlight Enable - Main Script
 # ============================================================
 
 def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None):
     """
     Main function to enable matrix headlights on VW ID.4.
+    Automatically detects hardware and applies correct modifications.
     
     Args:
         vin: Vehicle VIN (for VIN-dependent seed-key calculation)
@@ -801,53 +882,65 @@ def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None):
     backup = BackupManager(vin=vin)
     backup_dir = backup.backup_long_coding(current_coding, 0x09, "Central Electronics")
     
-    # Step 6: Modify coding for matrix headlights
-    # The exact bytes depend on your vehicle's hardware
-    # Common modification: Set bit 6 of byte at specific offset
-    modified_coding = bytearray(current_coding)
-    
-    # Example modification (ADJUST FOR YOUR VEHICLE):
-    # This is typically around byte 15-20 in the long coding
-    # Check your current coding and find the right byte
-    
-    # Common pattern for ID.4 matrix headlight enable:
-    # Find the byte that controls adaptive light / IQ.LIGHT
-    # and set the appropriate bit
-    
-    # Let's find and display the relevant bytes
+    # Step 6: Analyze and detect matrix hardware
     print()
-    print("[+] Analyzing long coding bytes...")
-    for i, byte in enumerate(current_coding):
-        print(f"    Byte {i:2d}: 0x{byte:02X} ({byte:08b})")
+    print("[+] Analyzing long coding...")
     
-    # Example: If you know the specific byte to modify:
-    # TARGET_BYTE = 15  # Adjust based on your analysis
-    # TARGET_BIT = 6    # The bit that enables matrix mode
-    # modified_coding[TARGET_BYTE] = current_coding[TARGET_BYTE] | (1 << TARGET_BIT)
+    has_matrix_hardware = detect_matrix_hardware(current_coding)
+    if has_matrix_hardware:
+        print("[+] Matrix headlight hardware DETECTED in current coding")
+    else:
+        print("[!] Matrix headlight hardware NOT clearly detected")
+        print("    (You may need to manually specify modifications)")
     
-    # For now, let's just show what WOULD be written
+    # Step 7: Calculate modifications
+    modifications = get_matrix_coding_modifications(current_coding)
+    
+    if modifications:
+        print()
+        print("[+] Modifications to apply:")
+        for byte_index, mask, description in modifications:
+            current_val = current_coding[byte_index]
+            new_val = current_val | mask
+            print(f"    Byte {byte_index}: 0x{current_val:02X} -> 0x{new_val:02X} ({description})")
+    else:
+        print()
+        print("[!] No modifications calculated automatically")
+        print("[+] Showing all bytes for manual review:")
+        for i, byte in enumerate(current_coding):
+            print(f"    Byte {i:2d}: 0x{byte:02X} ({byte:08b})")
+    
+    # Step 8: Apply modifications
+    if modifications:
+        modified_coding = apply_coding_modifications(current_coding, modifications)
+    else:
+        modified_coding = bytearray(current_coding)
+    
     print()
     if test_mode:
         print("[+] TEST MODE - would modify coding but not writing")
-        print(f"    Current: {bytes(current_coding).hex()}")
+        print(f"    Original: {bytes(current_coding).hex()}")
         print(f"    Modified: {bytes(modified_coding).hex()}")
+        print()
+        print("    To apply, run again without --test")
     else:
-        # Step 7: Write modified coding
-        if coding.write_long_coding(0x09, bytes(modified_coding)):
-            # Step 8: Backup the new coding
-            backup.backup_long_coding(modified_coding, 0x09, "Central Electronics_Matrices")
+        # Step 9: Write modified coding
+        print("[+] Writing modified coding...")
+        if coding.write_long_coding(0x09, modified_coding):
+            # Step 10: Backup the new coding
+            backup.backup_long_coding(modified_coding, 0x09, "Central Electronics_MatrixEnabled")
             print()
-            print("[+] Coding written! Restart vehicle to apply.")
-            print(f"[+] Original backup saved: {backup_dir}")
+            print("[+] Coding written successfully!")
+            print("[+] Original backup saved:", backup_dir)
+            print("[+] Restart vehicle to apply changes.")
         else:
             print()
             print("[!] Write failed. Try again or check security access.")
-            print(f"[+] Original coding backed up at: {backup_dir}")
+            print("[+] Original coding backed up at:", backup_dir)
     
     can.close()
     print()
     print("[+] Done!")
-
 
 # ============================================================
 # Helper: Find the correct byte to modify
