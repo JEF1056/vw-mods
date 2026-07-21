@@ -12,8 +12,11 @@ import can
 import struct
 import time
 import sys
+import os
 import hashlib
 import secrets
+import datetime
+import subprocess
 
 # ============================================================
 # VW ID.4 UDS Constants
@@ -220,6 +223,333 @@ class VWCANInterface:
 
 
 # ============================================================
+# OBD Dongle Capability Check
+# ============================================================
+
+class OBDChecker:
+    """Checks if the OBD dongle supports required VW coding capabilities."""
+    
+    REQUIRED_FEATURES = {
+        'can_500kbps': 'CAN bus at 500kbps (VW standard)',
+        'uds_support': 'UDS protocol (ISO 14229)',
+        'extended_frames': 'Extended CAN frames (29-bit ID)',
+        'multi_frame': 'Multi-frame CAN transmission',
+        'write_capability': 'Read/write capability (not read-only)',
+    }
+    
+    @staticmethod
+    def check_os_requirements():
+        """Check OS-level requirements for CAN interface."""
+        results = []
+        
+        # Check for socketcan support (Linux)
+        try:
+            subprocess.run(['ip', 'link', 'show'], capture_output=True, check=True, timeout=5)
+            results.append(('socketcan', 'socketcan utilities available', True))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            results.append(('socketcan', 'socketcan utilities not found', False))
+        
+        # Check for python-can installation
+        try:
+            import can
+            results.append(('python-can', f'python-can v{can.__version__} installed', True))
+        except ImportError:
+            results.append(('python-can', 'python-can not installed', False))
+        
+        # Check for root/sudo (often needed for CAN interface)
+        is_root = os.geteuid() == 0
+        results.append(('root', 'Running as root' if is_root else 'Not running as root (may need sudo)', is_root))
+        
+        return results
+    
+    @staticmethod
+    def check_dongle_hardware(can_channel):
+        """Check if the OBD dongle hardware supports required features."""
+        results = []
+        
+        # Check CAN interface exists
+        try:
+            result = subprocess.run(
+                ['ip', 'link', 'show', can_channel],
+                capture_output=True, text=True, check=True, timeout=5
+            )
+            if 'DOWN' in result.stdout:
+                results.append(('interface_up', f'{can_channel} interface is DOWN', False))
+            elif 'UNKNOWN' in result.stdout:
+                results.append(('interface_up', f'{can_channel} interface not found', False))
+            else:
+                results.append(('interface_up', f'{can_channel} interface is UP', True))
+        except subprocess.CalledProcessError:
+            results.append(('interface_up', f'{can_channel} interface not found', False))
+        except FileNotFoundError:
+            results.append(('interface_up', 'ip command not found, skipping interface check', False))
+        
+        # Check bitrate configuration
+        try:
+            result = subprocess.run(
+                ['ip', '-d', 'link', 'show', can_channel],
+                capture_output=True, text=True, check=True, timeout=5
+            )
+            if 'bitrate 500000' in result.stdout or 'bitrate=500000' in result.stdout:
+                results.append(('bitrate', 'CAN bitrate correctly set to 500kbps', True))
+            elif 'bitrate' in result.stdout.lower():
+                results.append(('bitrate', 'CAN bitrate configured but may not be 500kbps', False))
+            else:
+                results.append(('bitrate', 'CAN bitrate not configured', False))
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            results.append(('bitrate', 'Could not check bitrate configuration', False))
+        
+        return results
+    
+    @staticmethod
+    def check_uds_capabilities(can_interface):
+        """Test actual UDS protocol capabilities by sending test requests."""
+        results = []
+        
+        # Test 1: Send tester present (simplest UDS command)
+        try:
+            heartbeat = build_obd_request([SID_TESTER_PRESENT, 0x00])
+            response = can_interface.send_request(heartbeat, can_id=0x7DF)
+            
+            if response:
+                results.append(('tester_present', 'UDS Tester Present (0x3E) response received', True))
+            else:
+                results.append(('tester_present', 'No response to Tester Present request', False))
+        except Exception as e:
+            results.append(('tester_present', f'Error sending Tester Present: {e}', False))
+        
+        # Test 2: Try to read VIN (requires basic security access)
+        try:
+            # Request default session first
+            session_req = build_obd_request([SID_SESSION_CONTROL, DEFAULT_SESSION])
+            session_resp = can_interface.send_request(session_req)
+            
+            if session_resp and session_resp[2] == 0x50:
+                results.append(('session_control', 'UDS Session Control (0x10) working', True))
+            else:
+                results.append(('session_control', 'Session Control response unexpected', False))
+        except Exception as e:
+            results.append(('session_control', f'Error in Session Control test: {e}', False))
+        
+        # Test 3: Check if module 09 responds
+        try:
+            # Try reading VIN from module 09
+            did_vin = [0xF1, 0x80]
+            vin_request = build_obd_request([SID_DID_READ] + did_vin)
+            vin_response = can_interface.send_request(vin_request)
+            
+            if vin_response and vin_response[2] == 0x62:
+                results.append(('module_09_vin', 'Module 09 VIN read successful', True))
+            else:
+                results.append(('module_09_vin', 'Module 09 VIN read failed or no response', False))
+        except Exception as e:
+            results.append(('module_09_vin', f'Error reading Module 09 VIN: {e}', False))
+        
+        return results
+    
+    @staticmethod
+    def print_check_results(os_checks, hardware_checks, uds_checks):
+        """Print formatted check results."""
+        print()
+        print("=" * 60)
+        print("  OBD Dongle Capability Check")
+        print("=" * 60)
+        print()
+        
+        all_passed = True
+        
+        print("[*] OS & Environment Checks:")
+        print("-" * 40)
+        for name, msg, passed in os_checks:
+            status = "PASS" if passed else "WARN"
+            if not passed:
+                all_passed = False
+            print(f"    [{status}] {msg}")
+        print()
+        
+        print("[*] Hardware & Interface Checks:")
+        print("-" * 40)
+        for name, msg, passed in hardware_checks:
+            status = "PASS" if passed else "FAIL"
+            if not passed:
+                all_passed = False
+            print(f"    [{status}] {msg}")
+        print()
+        
+        print("[*] UDS Protocol Capability Tests:")
+        print("-" * 40)
+        for name, msg, passed in uds_checks:
+            status = "PASS" if passed else "FAIL"
+            if not passed:
+                all_passed = False
+            print(f"    [{status}] {msg}")
+        print()
+        
+        print("=" * 60)
+        if all_passed:
+            print("  Result: All checks PASSED - Dongle is capable")
+        else:
+            print("  Result: Some checks FAILED - Review warnings above")
+        print("=" * 60)
+        print()
+        
+        return all_passed
+    
+    @staticmethod
+    def run_full_check(can_channel='can0'):
+        """Run all capability checks."""
+        print("[*] Checking environment...")
+        os_checks = OBDChecker.check_os_requirements()
+        
+        print("[*] Checking hardware...")
+        hardware_checks = OBDChecker.check_dongle_hardware(can_channel)
+        
+        # Connect to CAN for UDS tests
+        can = VWCANInterface(channel=can_channel)
+        if can.connect():
+            print("[*] Testing UDS capabilities...")
+            time.sleep(0.5)  # Brief pause for interface stabilization
+            uds_checks = OBDChecker.check_uds_capabilities(can)
+            can.close()
+        else:
+            uds_checks = [
+                ('uds_test', 'Could not connect to CAN for UDS tests', False),
+                ('module_09_vin', 'Could not connect for Module 09 test', False),
+            ]
+        
+        return OBDChecker.print_check_results(os_checks, hardware_checks, uds_checks)
+
+
+# ============================================================
+# Backup Management
+# ============================================================
+
+class BackupManager:
+    """Manages backup and restore of vehicle coding data."""
+    
+    BACKUP_DIR = "backups"
+    
+    def __init__(self, vin=None):
+        self.vin = vin or "unknown"
+        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.backup_dir = os.path.join(self.BACKUP_DIR, f"{self.vin}_{self.timestamp}")
+    
+    def create_backup_dir(self):
+        """Create backup directory with timestamp."""
+        os.makedirs(self.backup_dir, exist_ok=True)
+        return self.backup_dir
+    
+    def backup_long_coding(self, coding_data, module_id=0x09, module_name="Central Electronics"):
+        """Create a backup of the current long coding data."""
+        self.create_backup_dir()
+        
+        # Save raw hex file
+        hex_file = os.path.join(self.backup_dir, f"module_{module_id:02X}_coding.hex")
+        with open(hex_file, 'w') as f:
+            f.write(coding_data.hex().upper())
+        
+        # Save human-readable file
+        readable_file = os.path.join(self.backup_dir, f"module_{module_id:02X}_coding.txt")
+        with open(readable_file, 'w') as f:
+            f.write(f"VW ID.4 Module Backup\n")
+            f.write(f"{'=' * 50}\n")
+            f.write(f"Module: {module_id:02X} - {module_name}\n")
+            f.write(f"VIN: {self.vin}\n")
+            f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Timestamp: {self.timestamp}\n")
+            f.write(f"{'=' * 50}\n\n")
+            f.write(f"Raw Hex:\n")
+            f.write(f"{coding_data.hex().upper()}\n\n")
+            f.write(f"Byte-by-Byte:\n")
+            for i, byte in enumerate(coding_data):
+                f.write(f"  Byte {i:2d}: 0x{byte:02X} = {byte:3d} = {byte:08b}\n")
+            f.write(f"\nTotal: {len(coding_data)} bytes\n")
+        
+        # Save backup manifest
+        manifest_file = os.path.join(self.backup_dir, "manifest.txt")
+        with open(manifest_file, 'w') as f:
+            f.write(f"Backup Manifest\n")
+            f.write(f"{'=' * 50}\n")
+            f.write(f"VIN: {self.vin}\n")
+            f.write(f"Created: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Modules backed up:\n")
+            f.write(f"  - Module {module_id:02X} ({module_name})\n")
+            f.write(f"\nFiles in this backup:\n")
+            f.write(f"  - module_{module_id:02X}_coding.hex (raw hex data)\n")
+            f.write(f"  - module_{module_id:02X}_coding.txt (human readable)\n")
+            f.write(f"  - manifest.txt (this file)\n")
+        
+        print(f"[+] Backup created: {self.backup_dir}")
+        print(f"    - {os.path.basename(hex_file)}")
+        print(f"    - {os.path.basename(readable_file)}")
+        print(f"    - {os.path.basename(manifest_file)}")
+        
+        return self.backup_dir
+    
+    def restore_coding(self, module_id=0x09):
+        """Restore coding from the most recent backup."""
+        if not os.path.exists(self.BACKUP_DIR):
+            print(f"[-] Backup directory not found: {self.BACKUP_DIR}")
+            return None
+        
+        # Find most recent backup for this VIN
+        backups = sorted([d for d in os.listdir(self.BACKUP_DIR) 
+                         if os.path.isdir(os.path.join(self.BACKUP_DIR, d))])
+        
+        if not backups:
+            print(f"[-] No backups found")
+            return None
+        
+        # Find the most recent backup with coding for this module
+        for backup_name in reversed(backups):
+            backup_path = os.path.join(self.BACKUP_DIR, backup_name)
+            hex_file = os.path.join(backup_path, f"module_{module_id:02X}_coding.hex")
+            
+            if os.path.exists(hex_file):
+                print(f"[+] Found backup: {backup_name}")
+                
+                with open(hex_file, 'r') as f:
+                    hex_data = f.read().strip()
+                
+                coding_data = bytes.fromhex(hex_data)
+                print(f"[+] Loaded {len(coding_data)} bytes from backup")
+                
+                return coding_data
+        
+        print(f"[-] No backup found for Module {module_id:02X}")
+        return None
+    
+    def list_backups(self):
+        """List all available backups."""
+        if not os.path.exists(self.BACKUP_DIR):
+            print(f"No backups found in {self.BACKUP_DIR}")
+            return
+        
+        backups = sorted([d for d in os.listdir(self.BACKUP_DIR) 
+                         if os.path.isdir(os.path.join(self.BACKUP_DIR, d))])
+        
+        if not backups:
+            print(f"No backups found in {self.BACKUP_DIR}")
+            return
+        
+        print(f"\nAvailable backups ({len(backups)} total):")
+        print("-" * 50)
+        for backup_name in backups:
+            backup_path = os.path.join(self.BACKUP_DIR, backup_name)
+            manifest = os.path.join(backup_path, "manifest.txt")
+            
+            if os.path.exists(manifest):
+                with open(manifest, 'r') as f:
+                    lines = f.readlines()
+                    for line in lines:
+                        if line.startswith("Created:") or line.startswith("  - Module"):
+                            print(f"  {line.strip()}")
+            else:
+                print(f"  {backup_name}")
+            print()
+
+
+# ============================================================
 # UDS Session & Security
 # ============================================================
 
@@ -404,7 +734,11 @@ def enable_matrix_headlights(vin=None, test_mode=True):
         can.close()
         return
     
-    # Step 5: Modify coding for matrix headlights
+    # Step 5: Backup current coding before modification
+    backup = BackupManager(vin=vin)
+    backup_dir = backup.backup_long_coding(current_coding, 0x09, "Central Electronics")
+    
+    # Step 6: Modify coding for matrix headlights
     # The exact bytes depend on your vehicle's hardware
     # Common modification: Set bit 6 of byte at specific offset
     modified_coding = bytearray(current_coding)
@@ -435,16 +769,17 @@ def enable_matrix_headlights(vin=None, test_mode=True):
         print(f"    Current: {bytes(current_coding).hex()}")
         print(f"    Modified: {bytes(modified_coding).hex()}")
     else:
-        # Step 6: Write modified coding
+        # Step 7: Write modified coding
         if coding.write_long_coding(0x09, bytes(modified_coding)):
+            # Step 8: Backup the new coding
+            backup.backup_long_coding(modified_coding, 0x09, "Central Electronics_Matrices")
             print()
             print("[+] Coding written! Restart vehicle to apply.")
+            print(f"[+] Original backup saved: {backup_dir}")
         else:
             print()
             print("[!] Write failed. Try again or check security access.")
-    
-    # Step 7: Save backup
-    coding.save_coding_to_file(current_coding)
+            print(f"[+] Original coding backed up at: {backup_dir}")
     
     can.close()
     print()
@@ -493,6 +828,43 @@ def analyze_coding(coding_bytes):
 # Main
 # ============================================================
 
+def restore_coding(vin=None, channel='can0'):
+    """Restore coding from the most recent backup."""
+    print("=" * 60)
+    print("  VW ID.4 Coding Restore from Backup")
+    print("=" * 60)
+    print()
+    
+    backup = BackupManager(vin=vin)
+    coding_data = backup.restore_coding(0x09)
+    
+    if not coding_data:
+        print("[!] No backup found to restore.")
+        return
+    
+    # Connect and restore
+    can = VWCANInterface(channel=channel)
+    if not can.connect():
+        sys.exit(1)
+    
+    session = UDSSession(can)
+    session.set_session(EXTENDED_SESSION)
+    session.unlock_security(SECURITY_LEVEL_3, vin)
+    
+    coding = LongCoding(can)
+    if coding.write_long_coding(0x09, coding_data, "Central Electronics"):
+        print("[+] Coding restored! Restart vehicle to apply.")
+    else:
+        print("[!] Restore failed.")
+    
+    can.close()
+
+
+def check_dongle(channel='can0'):
+    """Run full OBD dongle capability check."""
+    OBDChecker.run_full_check(channel)
+
+
 if __name__ == "__main__":
     import argparse
     
@@ -501,13 +873,23 @@ if __name__ == "__main__":
     parser.add_argument('--test', action='store_true', help='Test mode (don\'t write)')
     parser.add_argument('--analyze', action='store_true', help='Analyze coding bytes')
     parser.add_argument('--channel', type=str, default='can0', help='CAN channel')
+    parser.add_argument('--restore', action='store_true', help='Restore coding from latest backup')
+    parser.add_argument('--list-backups', action='store_true', help='List all available backups')
+    parser.add_argument('--check', action='store_true', help='Check OBD dongle capabilities')
     
     args = parser.parse_args()
     
     # Set global channel
     VWCANInterface.channel = args.channel
     
-    if args.analyze:
+    if args.check:
+        check_dongle(args.channel)
+    elif args.list_backups:
+        backup = BackupManager(vin=args.vin)
+        backup.list_backups()
+    elif args.restore:
+        restore_coding(vin=args.vin, channel=args.channel)
+    elif args.analyze:
         # Read and analyze
         can = VWCANInterface(channel=args.channel)
         can.connect()
