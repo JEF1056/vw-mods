@@ -53,6 +53,12 @@ DID_VIN               = 0xF180  # Vehicle Identification Number
 # VW Seed-Key Algorithm (Reverse-engineered)
 # ============================================================
 
+# IMPORTANT: VW uses SA2 bytecode VM for security access (not simple XOR)
+# The SA2 script lives inside the ECU's flash container (FRF/ODX files)
+# Each ECU can have a different script. Our hardcoded algorithms are guesses.
+# Reference: https://icanhack.nl/knowledge-base/reverse-engineering/ecu-flashing/
+# Reference: https://github.com/bri3d/VW_Flash
+
 # VW security level 3 seed-key algorithms (community reverse-engineered)
 # Reference: https://github.com/nim65s/python-uds, VCDS source, VBScab forums
 
@@ -143,6 +149,15 @@ def vw_compute_key(seed_bytes, security_level=3, vin=None):
         results.append(('algo5_vin_dependent', key_bytes))
     
     return results
+
+
+def vw_compute_key_manual(seed_bytes, key_hex):
+    """
+    Use a manually provided key (captured from another tool like OBDeEditor/ODIS).
+    This is the most reliable method if you have a known-working key.
+    """
+    key_bytes = bytes.fromhex(key_hex)
+    return key_bytes
 
 
 # ============================================================
@@ -624,13 +639,19 @@ class UDSSession:
         print(f"[-] Session switch failed. Response: {response.hex() if response else 'None'}")
         return False
     
-    def unlock_security(self, level=SECURITY_LEVEL_3, vin=None, algorithm=None):
+    def unlock_security(self, level=SECURITY_LEVEL_3, vin=None, algorithm=None, manual_key=None):
         """Perform VW seed-key security access.
         
+        VW uses SA2 bytecode VM for security access (not simple XOR).
+        Each ECU can have a different SA2 script. Our hardcoded algorithms are guesses.
+        
         Tries all known VW algorithms until one succeeds.
-        For 2023 ID.4, MEB platform algorithm (algo4) or VIN-dependent (algo5) are most likely.
+        For 2023 ID.4, algo4 (MEB platform) or algo5 (VIN-dependent) are most likely.
+        
+        If manual_key is provided, use that key instead of computing it.
         """
         print(f"[+] Requesting security access (level 0x{level:02X})...")
+        print("[!] Note: VW uses SA2 bytecode VM for security - algorithms below are guesses")
         
         # Step 1: Request seed
         seed_request = build_obd_request([SID_SECURITY_ACCESS, level])
@@ -645,25 +666,39 @@ class UDSSession:
         print(f"[+] Seed received: {seed_bytes.hex()}")
         
         # Step 2: Try all algorithms until one works
-        key_results = vw_compute_key(seed_bytes, level, vin)
-        
-        for algo_name, key_bytes in key_results:
-            if algorithm and algo_name != algorithm:
-                continue
-            
-            print(f"    Trying {algo_name}: key={key_bytes.hex()} ... ", end='')
-            
-            # Send key
+        if manual_key:
+            # Use manually provided key
+            print(f"[+] Using manual key: {manual_key}")
+            key_bytes = vw_compute_key_manual(seed_bytes, manual_key)
             key_request = build_obd_request([SID_SECURITY_ACCESS, level + 1] + list(key_bytes))
             key_response = self.can.send_request(key_request)
             
             if key_response and key_response[2] == (SID_SECURITY_ACCESS + 0x40):
-                print("SUCCESS")
-                print(f"[+] Security access granted! (algorithm: {algo_name})")
-                self.successful_algorithm = algo_name
+                print("[+] Security access granted! (manual key)")
                 return True
             else:
-                print("failed")
+                print(f"[-] Manual key failed. Response: {key_response.hex() if key_response else 'None'}")
+                return False
+        else:
+            key_results = vw_compute_key(seed_bytes, level, vin)
+            
+            for algo_name, key_bytes in key_results:
+                if algorithm and algo_name != algorithm:
+                    continue
+                
+                print(f"    Trying {algo_name}: key={key_bytes.hex()} ... ", end='')
+                
+                # Send key
+                key_request = build_obd_request([SID_SECURITY_ACCESS, level + 1] + list(key_bytes))
+                key_response = self.can.send_request(key_request)
+                
+                if key_response and key_response[2] == (SID_SECURITY_ACCESS + 0x40):
+                    print("SUCCESS")
+                    print(f"[+] Security access granted! (algorithm: {algo_name})")
+                    self.successful_algorithm = algo_name
+                    return True
+                else:
+                    print("failed")
         
         if algorithm:
             print(f"[-] Specified algorithm '{algorithm}' did not work.")
@@ -826,7 +861,7 @@ def apply_coding_modifications(coding_bytes, modifications):
 # Matrix Headlight Enable - Main Script
 # ============================================================
 
-def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None):
+def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None, manual_key=None):
     """
     Main function to enable matrix headlights on VW ID.4.
     Automatically detects hardware and applies correct modifications.
@@ -862,7 +897,7 @@ def enable_matrix_headlights(vin=None, test_mode=True, algorithm=None):
     
     # Step 3: Security access (tries all known algorithms automatically)
     print()
-    if not session.unlock_security(SECURITY_LEVEL_3, vin, algorithm):
+    if not session.unlock_security(SECURITY_LEVEL_3, vin, algorithm, manual_key):
         print("[!] All algorithms failed for level 3. Trying level 1...")
         if not session.unlock_security(SECURITY_LEVEL_1, vin):
             print("[!] Level 1 also failed. Cannot proceed with coding.")
@@ -984,7 +1019,7 @@ def analyze_coding(coding_bytes):
 # Main
 # ============================================================
 
-def restore_coding(vin=None, channel='can0', algorithm=None):
+def restore_coding(vin=None, channel='can0', algorithm=None, manual_key=None):
     """Restore coding from the most recent backup."""
     print("=" * 60)
     print("  VW ID.4 Coding Restore from Backup")
@@ -1005,7 +1040,7 @@ def restore_coding(vin=None, channel='can0', algorithm=None):
     
     session = UDSSession(can)
     session.set_session(EXTENDED_SESSION)
-    session.unlock_security(SECURITY_LEVEL_3, vin, algorithm)
+    session.unlock_security(SECURITY_LEVEL_3, vin, algorithm, manual_key)
     
     coding = LongCoding(can)
     if coding.write_long_coding(0x09, coding_data, "Central Electronics"):
@@ -1043,6 +1078,9 @@ def main_interactive():
     print("  Interactive Mode")
     print("=" * 60)
     print()
+    print("[!] Note: VW uses SA2 bytecode VM for security access.")
+    print("    If all algorithms fail, use option 7 to enter a known-working key.")
+    print()
     
     # Menu
     print("Select action:")
@@ -1052,12 +1090,23 @@ def main_interactive():
     print("  4) List backups")
     print("  5) Check OBD dongle")
     print("  6) Exit")
+    print("  7) Test security access (capture seed/key)")
     print()
     
     action = get_input("Action", "1")
     
     if action == "6" or action is None:
         print("[+] Exiting.")
+        return
+    elif action == "7":
+        channel = get_input("CAN channel", "can0")
+        print("\nTesting security access...")
+        can = VWCANInterface(channel=channel)
+        if can.connect():
+            session = UDSSession(can)
+            session.set_session(EXTENDED_SESSION)
+            session.unlock_security(SECURITY_LEVEL_3)
+            can.close()
         return
     elif action == "5":
         channel = get_input("CAN channel", "can0")
@@ -1075,6 +1124,7 @@ def main_interactive():
         for i, algo in enumerate(VW_ALGORITHMS, 1):
             print(f"  {i}) {algo[0]}")
         print(f"  6) VIN-dependent (algo5)")
+        print(f"  7) Manual key entry")
         algo_choice = get_input("Algorithm", "2")
         algorithm_map = {
             '1': 'algo1_mqb_standard',
@@ -1084,8 +1134,13 @@ def main_interactive():
             '5': 'algo4_meb_platform',
             '6': 'algo5_vin_dependent',
         }
-        algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
-        restore_coding(vin=vin, channel=channel, algorithm=algorithm)
+        algorithm = None
+        manual_key = None
+        if algo_choice == '7':
+            manual_key = get_input("Manual key (hex, e.g. 'ABCD')")
+        else:
+            algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+        restore_coding(vin=vin, channel=channel, algorithm=algorithm, manual_key=manual_key)
         return
     elif action == "2":
         channel = get_input("CAN channel", "can0")
@@ -1094,6 +1149,7 @@ def main_interactive():
         for i, algo in enumerate(VW_ALGORITHMS, 1):
             print(f"  {i}) {algo[0]}")
         print(f"  5) VIN-dependent (algo5)")
+        print(f"  6) Manual key entry")
         algo_choice = get_input("Algorithm", "2")
         algorithm_map = {
             '1': 'algo1_mqb_standard',
@@ -1102,13 +1158,18 @@ def main_interactive():
             '4': 'algo2_simple_xor',
             '5': 'algo5_vin_dependent',
         }
-        algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+        algorithm = None
+        manual_key = None
+        if algo_choice == '6':
+            manual_key = get_input("Manual key (hex, e.g. 'ABCD')")
+        else:
+            algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
         
         can = VWCANInterface(channel=channel)
         can.connect()
         session = UDSSession(can)
         session.set_session(EXTENDED_SESSION)
-        session.unlock_security(SECURITY_LEVEL_3, vin, algorithm)
+        session.unlock_security(SECURITY_LEVEL_3, vin, algorithm, manual_key)
         
         coding_interface = LongCoding(can)
         coding = coding_interface.read_long_coding(0x09)
@@ -1132,6 +1193,7 @@ def main_interactive():
     for i, algo in enumerate(VW_ALGORITHMS, 1):
         print(f"  {i}) {algo[0]}")
     print(f"  5) VIN-dependent (algo5)")
+    print(f"  6) Manual key entry")
     algo_choice = get_input("Algorithm", "2")
     algorithm_map = {
         '1': 'algo1_mqb_standard',
@@ -1140,12 +1202,17 @@ def main_interactive():
         '4': 'algo2_simple_xor',
         '5': 'algo5_vin_dependent',
     }
-    algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+    algorithm = None
+    manual_key = None
+    if algo_choice == '6':
+        manual_key = get_input("Manual key (hex, e.g. 'ABCD')")
+    else:
+        algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
     
     test_mode_input = get_input("Test mode? (writes will be skipped, Y/n)", "Y")
     test_mode = test_mode_input.lower() != 'n'
     
-    enable_matrix_headlights(vin=vin, test_mode=test_mode, algorithm=algorithm)
+    enable_matrix_headlights(vin=vin, test_mode=test_mode, algorithm=algorithm, manual_key=manual_key)
 
 
 if __name__ == "__main__":
