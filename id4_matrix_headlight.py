@@ -928,41 +928,94 @@ def check_dongle(channel='can0'):
     OBDChecker.run_full_check(channel)
 
 
-if __name__ == "__main__":
-    import argparse
+def get_input(prompt, default=None):
+    """Get user input with optional default value."""
+    if default is not None:
+        display = f"{prompt} [{default}]: "
+    else:
+        display = f"{prompt}: "
     
-    parser = argparse.ArgumentParser(description="VW ID.4 Matrix Headlight Enable")
-    parser.add_argument('--vin', type=str, help='Vehicle VIN for seed-key calculation')
-    parser.add_argument('--test', action='store_true', help='Test mode (don\'t write)')
-    parser.add_argument('--analyze', action='store_true', help='Analyze coding bytes')
-    parser.add_argument('--channel', type=str, default='can0', help='CAN channel')
-    parser.add_argument('--restore', action='store_true', help='Restore coding from latest backup')
-    parser.add_argument('--list-backups', action='store_true', help='List all available backups')
-    parser.add_argument('--check', action='store_true', help='Check OBD dongle capabilities')
-    parser.add_argument('--algorithm', type=str, 
-                        choices=['algo1_mqb_standard', 'algo2_simple_xor', 'algo3_mqb_evo', 
-                                 'algo4_meb_platform', 'algo5_vin_dependent'],
-                        help='Use specific seed-key algorithm')
+    try:
+        value = input(display).strip()
+        return value if value else default
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
+def main_interactive():
+    """Interactive mode - prompts user for all inputs."""
+    print("=" * 60)
+    print("  VW ID.4 Matrix Headlight Enable")
+    print("  Interactive Mode")
+    print("=" * 60)
+    print()
     
-    args = parser.parse_args()
+    # Menu
+    print("Select action:")
+    print("  1) Enable matrix headlights")
+    print("  2) Analyze coding bytes")
+    print("  3) Restore from backup")
+    print("  4) List backups")
+    print("  5) Check OBD dongle")
+    print("  6) Exit")
+    print()
     
-    # Set global channel
-    VWCANInterface.channel = args.channel
+    action = get_input("Action", "1")
     
-    if args.check:
-        check_dongle(args.channel)
-    elif args.list_backups:
-        backup = BackupManager(vin=args.vin)
+    if action == "6" or action is None:
+        print("[+] Exiting.")
+        return
+    elif action == "5":
+        channel = get_input("CAN channel", "can0")
+        check_dongle(channel)
+        return
+    elif action == "4":
+        vin = get_input("VIN (for backup filter, or leave blank)")
+        backup = BackupManager(vin=vin)
         backup.list_backups()
-    elif args.restore:
-        restore_coding(vin=args.vin, channel=args.channel, algorithm=args.algorithm)
-    elif args.analyze:
-        # Read and analyze
-        can = VWCANInterface(channel=args.channel)
+        return
+    elif action == "3":
+        channel = get_input("CAN channel", "can0")
+        vin = get_input("VIN (for seed-key calculation, or leave blank)")
+        print("\nAvailable algorithms:")
+        for i, algo in enumerate(VW_ALGORITHMS, 1):
+            print(f"  {i}) {algo[0]}")
+        print(f"  6) VIN-dependent (algo5)")
+        algo_choice = get_input("Algorithm", "2")
+        algorithm_map = {
+            '1': 'algo1_mqb_standard',
+            '2': 'algo4_meb_platform',
+            '3': 'algo3_mqb_evo',
+            '4': 'algo2_simple_xor',
+            '5': 'algo4_meb_platform',
+            '6': 'algo5_vin_dependent',
+        }
+        algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+        restore_coding(vin=vin, channel=channel, algorithm=algorithm)
+        return
+    elif action == "2":
+        channel = get_input("CAN channel", "can0")
+        vin = get_input("VIN (for seed-key calculation, or leave blank)")
+        print("\nAvailable algorithms:")
+        for i, algo in enumerate(VW_ALGORITHMS, 1):
+            print(f"  {i}) {algo[0]}")
+        print(f"  5) VIN-dependent (algo5)")
+        algo_choice = get_input("Algorithm", "2")
+        algorithm_map = {
+            '1': 'algo1_mqb_standard',
+            '2': 'algo4_meb_platform',
+            '3': 'algo3_mqb_evo',
+            '4': 'algo2_simple_xor',
+            '5': 'algo5_vin_dependent',
+        }
+        algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+        
+        can = VWCANInterface(channel=channel)
         can.connect()
         session = UDSSession(can)
         session.set_session(EXTENDED_SESSION)
-        session.unlock_security(SECURITY_LEVEL_3, vin=args.vin, algorithm=args.algorithm)
+        session.unlock_security(SECURITY_LEVEL_3, vin, algorithm)
         
         coding_interface = LongCoding(can)
         coding = coding_interface.read_long_coding(0x09)
@@ -971,5 +1024,36 @@ if __name__ == "__main__":
             analyze_coding(coding)
         
         can.close()
+        return
+    elif action == "1":
+        pass
     else:
-        enable_matrix_headlights(vin=args.vin, test_mode=args.test, algorithm=args.algorithm)
+        print("[!] Invalid action.")
+        return
+    
+    # Main flow - enable matrix headlights
+    channel = get_input("CAN channel", "can0")
+    vin = get_input("VIN (for seed-key calculation, or leave blank)")
+    
+    print("\nAvailable algorithms:")
+    for i, algo in enumerate(VW_ALGORITHMS, 1):
+        print(f"  {i}) {algo[0]}")
+    print(f"  5) VIN-dependent (algo5)")
+    algo_choice = get_input("Algorithm", "2")
+    algorithm_map = {
+        '1': 'algo1_mqb_standard',
+        '2': 'algo4_meb_platform',
+        '3': 'algo3_mqb_evo',
+        '4': 'algo2_simple_xor',
+        '5': 'algo5_vin_dependent',
+    }
+    algorithm = algorithm_map.get(algo_choice, 'algo4_meb_platform')
+    
+    test_mode_input = get_input("Test mode? (writes will be skipped, Y/n)", "Y")
+    test_mode = test_mode_input.lower() != 'n'
+    
+    enable_matrix_headlights(vin=vin, test_mode=test_mode, algorithm=algorithm)
+
+
+if __name__ == "__main__":
+    main_interactive()
